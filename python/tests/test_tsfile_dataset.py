@@ -482,6 +482,41 @@ def test_dataset_rejects_invalid_length_mode(tmp_path):
         TsFileDataFrame(str(path), show_progress=False, length_mode="invalid")
 
 
+def test_dataset_initialization_uses_catalog_stats_instead_of_runtime_getters(tmp_path, monkeypatch):
+    path = tmp_path / "weather.tsfile"
+    _write_weather_file(path, 0)
+
+    def fail_get_device_info(*_args, **_kwargs):
+        raise AssertionError("TsFileDataFrame initialization should not call get_device_info")
+
+    def fail_get_series_info_by_ref(*_args, **_kwargs):
+        raise AssertionError("TsFileDataFrame initialization should not call get_series_info_by_ref")
+
+    monkeypatch.setattr(TsFileSeriesReader, "get_device_info", fail_get_device_info)
+    monkeypatch.setattr(TsFileSeriesReader, "get_series_info_by_ref", fail_get_series_info_by_ref)
+
+    with TsFileDataFrame(str(path), show_progress=False) as tsdf:
+        assert len(tsdf) == 2
+        assert list(tsdf["count"]) == [3, 3]
+        assert list(tsdf["start_time"]) == [0, 0]
+        assert list(tsdf["end_time"]) == [2, 2]
+
+
+def test_dataset_timeseries_access_reuses_cached_stats(tmp_path, monkeypatch):
+    path = tmp_path / "weather.tsfile"
+    _write_weather_file(path, 0)
+
+    with TsFileDataFrame(str(path), show_progress=False) as tsdf:
+        def fail_get_series_info_by_ref(*_args, **_kwargs):
+            raise AssertionError("Timeseries creation should reuse cached stats")
+
+        monkeypatch.setattr(TsFileSeriesReader, "get_series_info_by_ref", fail_get_series_info_by_ref)
+
+        temperature = tsdf["weather.device_a.temperature"]
+        assert len(temperature) == 3
+        assert temperature.stats == {"start_time": 0, "end_time": 2, "count": 3}
+
+
 def test_dataset_rejects_duplicate_timestamps_across_shards(tmp_path):
     path1 = tmp_path / "part1.tsfile"
     path2 = tmp_path / "part2.tsfile"

@@ -153,11 +153,31 @@ def _validate_table_schema(existing: TableEntry, incoming: TableEntry, file_path
     )
 
 
+def _merge_time_bounds(target: dict, min_time: int, max_time: int) -> None:
+    if min_time is not None:
+        current_min = target.get("min_time")
+        target["min_time"] = min_time if current_min is None else min(current_min, min_time)
+    if max_time is not None:
+        current_max = target.get("max_time")
+        target["max_time"] = max_time if current_max is None else max(current_max, max_time)
+
+
+def _merge_series_stats(target: dict, shard_stats: dict, length_mode: str) -> None:
+    count_key, min_key, max_key = _series_stat_keys(length_mode)
+    shard_count = int(shard_stats[count_key])
+    target["count"] += shard_count
+    if shard_count <= 0:
+        return
+    _merge_time_bounds(target, shard_stats[min_key], shard_stats[max_key])
+
+
 def _register_reader(
     readers: Dict[str, object],
     index: _LogicalIndex,
+    cache: _DerivedCache,
     file_path: str,
     reader,
+    length_mode: str,
 ) -> None:
     """Merge one reader's catalog into the dataframe-wide logical index."""
     readers[file_path] = reader
@@ -179,6 +199,7 @@ def _register_reader(
             index.device_index_by_key[device_key] = device_idx
             index.device_order.append(device_key)
             index.device_refs.append([])
+            cache.devices.append({"min_time": device_entry.min_time, "max_time": device_entry.max_time})
             if any(value is None for value in device_entry.tag_values):
                 index.tables_with_sparse_tag_values.add(table_entry.table_name)
                 compressed_components = tuple(
@@ -188,6 +209,8 @@ def _register_reader(
                 )
                 compressed_key = (table_entry.table_name, compressed_components)
                 index.sparse_device_indices_by_compressed_path.setdefault(compressed_key, []).append(device_idx)
+        else:
+            _merge_time_bounds(cache.devices[device_idx], device_entry.min_time, device_entry.max_time)
         index.device_refs[device_idx].append((reader, device_id))
 
         for field_idx in range(len(table_entry.field_columns)):
@@ -195,52 +218,13 @@ def _register_reader(
             if series_ref not in index.series_ref_map:
                 index.series_refs_ordered.append(series_ref)
                 index.series_ref_map[series_ref] = []
+                cache.field_stats[series_ref] = {"count": 0, "min_time": None, "max_time": None}
             index.series_ref_map[series_ref].append((reader, device_id, field_idx))
-
-
-def _build_device_entry(refs: List[DeviceRef]) -> dict:
-    """Compute per-device time bounds from cheap metadata only.
-
-    We intentionally do not validate duplicates at the device level because
-    table-model fields do not necessarily share one complete timestamp axis.
-    Duplicate detection stays on the logical-series paths that materialize or
-    merge one field's timestamps.
-    """
-    infos = [reader.get_device_info(device_id) for reader, device_id in refs]
-    min_time = min(info["min_time"] for info in infos)
-    max_time = max(info["max_time"] for info in infos)
-
-    return {
-        "min_time": min_time,
-        "max_time": max_time,
-    }
-
-
-def _build_runtime_series_stats(refs: List[SeriesRef], length_mode: str) -> dict:
-    """Build per-series stats using the configured length semantics."""
-    count_key, min_key, max_key = _series_stat_keys(length_mode)
-    min_time = None
-    max_time = None
-    count = 0
-
-    for reader, device_id, field_idx in refs:
-        info = reader.get_series_info_by_ref(device_id, field_idx)
-        shard_min = info[min_key]
-        shard_max = info[max_key]
-        shard_count = info[count_key]
-
-        if shard_count == 0:
-            continue
-
-        count += shard_count
-        min_time = shard_min if min_time is None else min(min_time, shard_min)
-        max_time = shard_max if max_time is None else max(max_time, shard_max)
-
-    return {
-        "min_time": min_time,
-        "max_time": max_time,
-        "count": count,
-    }
+            _merge_series_stats(
+                cache.field_stats[series_ref],
+                catalog.series_stats_by_ref[(device_id, field_idx)],
+                length_mode,
+            )
 
 
 def _merge_field_timestamps(series_name: str, refs: List[SeriesRef], length_mode: str) -> np.ndarray:
@@ -434,33 +418,6 @@ def _read_field_by_position_overlap(
     return np.asarray(output_timestamps, dtype=np.int64), np.asarray(output_values, dtype=np.float64)
 
 
-def _build_field_stats(refs: List[SeriesRef], length_mode: str) -> dict:
-    """Aggregate per-series statistics for dataframe display."""
-    count_key, min_key, max_key = _series_stat_keys(length_mode)
-    min_time = None
-    max_time = None
-    count = 0
-
-    for reader, device_id, field_idx in refs:
-        info = reader.get_series_info_by_ref(device_id, field_idx)
-        shard_min = info[min_key]
-        shard_max = info[max_key]
-        shard_count = info[count_key]
-
-        if shard_count == 0:
-            continue
-
-        count += shard_count
-        min_time = shard_min if min_time is None else min(min_time, shard_min)
-        max_time = shard_max if max_time is None else max(max_time, shard_max)
-
-    return {
-        "min_time": min_time,
-        "max_time": max_time,
-        "count": count,
-    }
-
-
 class _LocIndexer:
     """Implement ``.loc[start_time:end_time, series_list]`` for aligned reads."""
 
@@ -597,12 +554,6 @@ class TsFileDataFrame:
         else:
             self._load_metadata_serial(TsFileSeriesReader)
 
-        self._cache.devices = [_build_device_entry(refs) for refs in self._index.device_refs]
-        for series_ref in self._index.series_refs_ordered:
-            self._cache.field_stats[series_ref] = _build_field_stats(
-                self._index.series_ref_map[series_ref], self._length_mode
-            )
-
         self._index.series_ref_set = set(self._index.series_refs_ordered)
         if not self._index.series_refs_ordered:
             raise ValueError("No valid time series found in the provided TsFile files")
@@ -625,8 +576,10 @@ class TsFileDataFrame:
             _register_reader(
                 self._readers,
                 self._index,
+                self._cache,
                 file_path,
                 reader_class(file_path, show_progress=self._show_progress and total == 1),
+                self._length_mode,
             )
             if total > 1:
                 self._show_loading_progress(index, total)
@@ -657,8 +610,10 @@ class TsFileDataFrame:
             _register_reader(
                 self._readers,
                 self._index,
+                self._cache,
                 file_path,
                 results[file_path],
+                self._length_mode,
             )
 
     def _get_series_components(self, series_ref: SeriesRefKey) -> Tuple[DeviceKey, TableEntry, int]:
@@ -763,7 +718,7 @@ class TsFileDataFrame:
         return Timeseries(
             series_name,
             self._index.series_ref_map[series_ref],
-            _build_runtime_series_stats(self._index.series_ref_map[series_ref], self._length_mode),
+            self._cache.field_stats[series_ref],
             self._assert_open,
             lambda: _merge_field_timestamps(series_name, self._index.series_ref_map[series_ref], self._length_mode),
             lambda offset, limit: _read_field_by_position(
