@@ -443,6 +443,45 @@ def test_dataset_metadata_discovery_uses_all_numeric_fields(tmp_path):
         assert list(tsdf["end_time"]) == [1, 1]
 
 
+def test_dataset_length_mode_field_uses_non_null_field_statistics(tmp_path):
+    path = tmp_path / "trailing_null_rows.tsfile"
+    _write_weather_rows_file(
+        path,
+        {
+            "time": [0, 1, 2],
+            "device": ["device_a", "device_a", "device_a"],
+            "temperature": [10.0, 11.0, np.nan],
+            "humidity": [50.0, 51.0, 52.0],
+        },
+    )
+
+    with TsFileDataFrame(str(path), show_progress=False, length_mode="field") as tsdf:
+        assert list(tsdf["count"]) == [2, 3]
+        assert list(tsdf["start_time"]) == [0, 0]
+        assert list(tsdf["end_time"]) == [1, 2]
+
+        temperature = tsdf["weather.device_a.temperature"]
+        humidity = tsdf["weather.device_a.humidity"]
+
+        assert len(temperature) == 2
+        assert temperature.stats == {"start_time": 0, "end_time": 1, "count": 2}
+        np.testing.assert_array_equal(temperature[:], np.array([10.0, 11.0]))
+        np.testing.assert_array_equal(temperature.timestamps, np.array([0, 1], dtype=np.int64))
+
+        assert len(humidity) == 3
+        assert humidity.stats == {"start_time": 0, "end_time": 2, "count": 3}
+        np.testing.assert_array_equal(humidity[:], np.array([50.0, 51.0, 52.0]))
+        np.testing.assert_array_equal(humidity.timestamps, np.array([0, 1, 2], dtype=np.int64))
+
+
+def test_dataset_rejects_invalid_length_mode(tmp_path):
+    path = tmp_path / "weather.tsfile"
+    _write_weather_file(path, 0)
+
+    with pytest.raises(ValueError, match="Invalid length_mode"):
+        TsFileDataFrame(str(path), show_progress=False, length_mode="invalid")
+
+
 def test_dataset_rejects_duplicate_timestamps_across_shards(tmp_path):
     path1 = tmp_path / "part1.tsfile"
     path2 = tmp_path / "part2.tsfile"
@@ -700,6 +739,79 @@ def test_reader_read_series_by_row_retries_across_native_row_query_boundaries():
     ts_arr, values = reader.read_series_by_row(device_id, 0, 5, 12)
     np.testing.assert_array_equal(ts_arr, np.arange(5, 17, dtype=np.int64))
     np.testing.assert_array_equal(values, np.arange(5, 17, dtype=np.float64))
+
+
+def test_reader_batch_reads_push_down_exact_tag_filter():
+    class _FakeColumn:
+        def __init__(self, values):
+            self._values = np.asarray(values)
+
+        def to_numpy(self):
+            return self._values
+
+    class _FakeArrowTable:
+        def __init__(self, columns):
+            self._columns = {name: _FakeColumn(values) for name, values in columns.items()}
+            self.num_rows = len(next(iter(columns.values()))) if columns else 0
+
+        def column(self, name):
+            return self._columns[name]
+
+    class _FakeResultSet:
+        def __init__(self, batches):
+            self._batches = list(batches)
+            self._index = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read_arrow_batch(self):
+            if self._index >= len(self._batches):
+                return None
+            batch = self._batches[self._index]
+            self._index += 1
+            return batch
+
+    class _FakeNativeReader:
+        def query_table(
+            self,
+            table_name,
+            column_names,
+            start_time=0,
+            end_time=0,
+            tag_filter=None,
+            batch_size=0,
+        ):
+            assert table_name == "weather"
+            assert column_names == ["temperature"]
+            assert start_time == 0
+            assert end_time == 2
+            assert repr(tag_filter) == "(TagFilter(city == 'beijing') AND TagFilter(device == 'device_a'))"
+            assert batch_size == 65536
+            return _FakeResultSet(
+                [
+                    _FakeArrowTable({"time": [0, 1], "temperature": [20.0, 21.5]}),
+                    _FakeArrowTable({"time": [2], "temperature": [23.0]}),
+                ]
+            )
+
+    reader = object.__new__(TsFileSeriesReader)
+    reader._reader = _FakeNativeReader()
+    reader._catalog = MetadataCatalog()
+    table_id = reader._catalog.add_table(
+        "weather",
+        ("city", "device"),
+        (TSDataType.STRING, TSDataType.STRING),
+        ("temperature",),
+    )
+    device_id = reader._catalog.add_device(table_id, ("beijing", "device_a"), 0, 2)
+
+    ts_arr, values = reader.read_device_fields_by_time_range(device_id, [0], 0, 2)
+    np.testing.assert_array_equal(ts_arr, np.array([0, 1, 2], dtype=np.int64))
+    np.testing.assert_array_equal(values["temperature"], np.array([20.0, 21.5, 23.0]))
 
 
 def test_series_path_resolution_allows_prefix_tag_values():

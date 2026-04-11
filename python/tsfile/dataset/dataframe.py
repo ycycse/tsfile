@@ -52,6 +52,7 @@ _DATACLASS_SLOTS = {"slots": True} if sys.version_info >= (3, 10) else {}
 # large enough to avoid excessive query_by_row round-trips when overlap spans
 # multiple shards.
 _OVERLAP_ROW_CHUNK_SIZE = 256
+_VALID_LENGTH_MODES = frozenset({"field", "timeline"})
 
 
 @dataclass(**_DATACLASS_SLOTS)
@@ -119,6 +120,19 @@ def _expand_paths(paths: Union[str, List[str]]) -> List[str]:
 
 def _series_lookup_hint(name: str) -> str:
     return f"Series not found: '{name}'. Use df.list_timeseries() to inspect available series."
+
+
+def _validate_length_mode(length_mode: str) -> str:
+    if length_mode not in _VALID_LENGTH_MODES:
+        valid = ", ".join(sorted(_VALID_LENGTH_MODES))
+        raise ValueError(f"Invalid length_mode '{length_mode}'. Expected one of: {valid}.")
+    return length_mode
+
+
+def _series_stat_keys(length_mode: str) -> Tuple[str, str, str]:
+    if length_mode == "field":
+        return "length", "min_time", "max_time"
+    return "timeline_length", "timeline_min_time", "timeline_max_time"
 
 
 def _validate_table_schema(existing: TableEntry, incoming: TableEntry, file_path: str) -> None:
@@ -202,17 +216,18 @@ def _build_device_entry(refs: List[DeviceRef]) -> dict:
     }
 
 
-def _build_runtime_series_stats(refs: List[SeriesRef]) -> dict:
-    """Build shared-timeline series stats from native timeline metadata."""
+def _build_runtime_series_stats(refs: List[SeriesRef], length_mode: str) -> dict:
+    """Build per-series stats using the configured length semantics."""
+    count_key, min_key, max_key = _series_stat_keys(length_mode)
     min_time = None
     max_time = None
     count = 0
 
     for reader, device_id, field_idx in refs:
         info = reader.get_series_info_by_ref(device_id, field_idx)
-        shard_min = info["timeline_min_time"]
-        shard_max = info["timeline_max_time"]
-        shard_count = info["timeline_length"]
+        shard_min = info[min_key]
+        shard_max = info[max_key]
+        shard_count = info[count_key]
 
         if shard_count == 0:
             continue
@@ -228,7 +243,7 @@ def _build_runtime_series_stats(refs: List[SeriesRef]) -> dict:
     }
 
 
-def _merge_field_timestamps(series_name: str, refs: List[SeriesRef]) -> np.ndarray:
+def _merge_field_timestamps(series_name: str, refs: List[SeriesRef], length_mode: str) -> np.ndarray:
     """Load and merge the full timestamp axis for one logical series on demand."""
     # This is intentionally lazy because it is one of the most expensive dataset
     # paths: it reads the full timestamp axis for the logical series across all
@@ -236,7 +251,12 @@ def _merge_field_timestamps(series_name: str, refs: List[SeriesRef]) -> np.ndarr
     # `Timeseries.timestamps`.
     time_parts = []
     for reader, device_id, field_idx in refs:
-        ts_arr, _ = reader.read_series_by_ref(device_id, field_idx, _QUERY_START, _QUERY_END)
+        if length_mode == "field":
+            field_length = reader.get_series_info_by_ref(device_id, field_idx)["length"]
+            ts_arr, _ = reader.read_series_by_row(device_id, field_idx, 0, field_length)
+        else:
+            ts_arr, _ = reader.read_series_by_ref(device_id, field_idx, _QUERY_START, _QUERY_END)
+
         if len(ts_arr) > 0:
             time_parts.append(ts_arr)
 
@@ -259,11 +279,28 @@ def _merge_field_timestamps(series_name: str, refs: List[SeriesRef]) -> np.ndarr
     return merged_timestamps
 
 
+def _build_position_read_info(reader, device_id: int, field_idx: int, length_mode: str) -> dict:
+    series_info = reader.get_series_info_by_ref(device_id, field_idx)
+    count_key, min_key, max_key = _series_stat_keys(length_mode)
+    return {
+        "length": series_info[count_key],
+        "min_time": series_info[min_key],
+        "max_time": series_info[max_key],
+        "timeline_length": series_info["timeline_length"],
+        "table_name": series_info["table_name"],
+        "column_name": series_info["column_name"],
+        "device_id": series_info["device_id"],
+        "field_idx": series_info["field_idx"],
+        "tag_columns": series_info["tag_columns"],
+        "tag_values": series_info["tag_values"],
+    }
+
 def _read_field_by_position(
     series_name: str,
     refs: List[SeriesRef],
     offset: int,
     limit: int,
+    length_mode: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Read one logical series by global position without materializing timestamps for non-overlapping shards."""
     if limit <= 0:
@@ -271,23 +308,10 @@ def _read_field_by_position(
 
     infos = []
     for reader, device_id, field_idx in refs:
-        series_info = reader.get_series_info_by_ref(device_id, field_idx)
-        infos.append(
-            {
-                "length": series_info["timeline_length"],
-                "min_time": series_info["timeline_min_time"],
-                "max_time": series_info["timeline_max_time"],
-                "table_name": series_info["table_name"],
-                "column_name": series_info["column_name"],
-                "device_id": series_info["device_id"],
-                "field_idx": series_info["field_idx"],
-                "tag_columns": series_info["tag_columns"],
-                "tag_values": series_info["tag_values"],
-            }
-        )
+        infos.append(_build_position_read_info(reader, device_id, field_idx, length_mode))
     ordered = sorted(zip(refs, infos), key=lambda item: (item[1]["min_time"], item[1]["max_time"]))
     if _has_time_range_overlap([info for _, info in ordered]):
-        return _read_field_by_position_overlap(series_name, ordered, offset, limit)
+        return _read_field_by_position_overlap(series_name, ordered, offset, limit, length_mode)
 
     remaining_offset = offset
     remaining_limit = limit
@@ -329,6 +353,7 @@ def _read_field_by_position_overlap(
     ordered: List[Tuple[SeriesRef, dict]],
     offset: int,
     limit: int,
+    length_mode: str,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Merge overlapping shard streams lazily until the requested global window is covered."""
     total_count = sum(info["length"] for _, info in ordered)
@@ -408,17 +433,19 @@ def _read_field_by_position_overlap(
 
     return np.asarray(output_timestamps, dtype=np.int64), np.asarray(output_values, dtype=np.float64)
 
-def _build_field_stats(refs: List[SeriesRef]) -> dict:
-    """Aggregate per-series timeline statistics for dataframe display."""
+
+def _build_field_stats(refs: List[SeriesRef], length_mode: str) -> dict:
+    """Aggregate per-series statistics for dataframe display."""
+    count_key, min_key, max_key = _series_stat_keys(length_mode)
     min_time = None
     max_time = None
     count = 0
 
     for reader, device_id, field_idx in refs:
         info = reader.get_series_info_by_ref(device_id, field_idx)
-        shard_min = info["timeline_min_time"]
-        shard_max = info["timeline_max_time"]
-        shard_count = info["timeline_length"]
+        shard_min = info[min_key]
+        shard_max = info[max_key]
+        shard_count = info[count_key]
 
         if shard_count == 0:
             continue
@@ -519,9 +546,10 @@ class _LocIndexer:
 class TsFileDataFrame:
     """Lazy-loaded unified numeric dataset view over multiple TsFile shards."""
 
-    def __init__(self, paths: Union[str, List[str]], show_progress: bool = True):
+    def __init__(self, paths: Union[str, List[str]], show_progress: bool = True, length_mode: str = "timeline"):
         self._paths = _expand_paths(paths)
         self._show_progress = show_progress
+        self._length_mode = _validate_length_mode(length_mode)
         self._readers: Dict[str, object] = {}
         self._index = _LogicalIndex()
         self._cache = _DerivedCache()
@@ -538,6 +566,7 @@ class TsFileDataFrame:
         obj._is_view = True
         obj._paths = parent._paths
         obj._show_progress = parent._show_progress
+        obj._length_mode = parent._length_mode
         obj._readers = parent._readers
         obj._index = _LogicalIndex(
             table_entries=parent._index.table_entries,
@@ -570,7 +599,9 @@ class TsFileDataFrame:
 
         self._cache.devices = [_build_device_entry(refs) for refs in self._index.device_refs]
         for series_ref in self._index.series_refs_ordered:
-            self._cache.field_stats[series_ref] = _build_field_stats(self._index.series_ref_map[series_ref])
+            self._cache.field_stats[series_ref] = _build_field_stats(
+                self._index.series_ref_map[series_ref], self._length_mode
+            )
 
         self._index.series_ref_set = set(self._index.series_refs_ordered)
         if not self._index.series_refs_ordered:
@@ -732,11 +763,11 @@ class TsFileDataFrame:
         return Timeseries(
             series_name,
             self._index.series_ref_map[series_ref],
-            _build_runtime_series_stats(self._index.series_ref_map[series_ref]),
+            _build_runtime_series_stats(self._index.series_ref_map[series_ref], self._length_mode),
             self._assert_open,
-            lambda: _merge_field_timestamps(series_name, self._index.series_ref_map[series_ref]),
+            lambda: _merge_field_timestamps(series_name, self._index.series_ref_map[series_ref], self._length_mode),
             lambda offset, limit: _read_field_by_position(
-                series_name, self._index.series_ref_map[series_ref], offset, limit
+                series_name, self._index.series_ref_map[series_ref], offset, limit, self._length_mode
             ),
         )
 
