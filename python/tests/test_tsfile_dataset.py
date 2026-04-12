@@ -18,6 +18,7 @@
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pytest
 
 from tsfile.dataset import dataframe as dataframe_module
@@ -859,6 +860,35 @@ def test_reader_read_series_values_by_row_uses_batch_arrow_query():
 
     values = reader.read_series_values_by_row(device_id, 0, 2, 4)
     np.testing.assert_array_equal(values, np.array([22.0, 23.0, 24.0, 25.0], dtype=np.float64))
+
+
+def test_reader_batch_arrow_returns_owning_writable_numpy_arrays():
+    class _FakeResultSet:
+        def __init__(self):
+            self._returned = False
+
+        def read_arrow_batch(self):
+            if self._returned:
+                return None
+            self._returned = True
+            return pa.Table.from_pydict({"time": [1, 2], "temperature": [20.0, 21.5]})
+
+    reader = object.__new__(TsFileSeriesReader)
+    timestamp_parts, field_parts = reader._collect_arrow_numeric_batches(
+        _FakeResultSet(),
+        ["temperature"],
+        include_timestamps=True,
+        table_name="weather",
+    )
+
+    timestamps = timestamp_parts[0]
+    values = field_parts["temperature"][0]
+    assert timestamps.flags.writeable
+    assert values.flags.writeable
+    assert timestamps.base is None
+    assert values.base is None
+    np.testing.assert_array_equal(timestamps, np.array([1, 2], dtype=np.int64))
+    np.testing.assert_array_equal(values, np.array([20.0, 21.5], dtype=np.float64))
 
 
 def test_reader_batch_reads_push_down_exact_tag_filter():

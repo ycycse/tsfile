@@ -489,12 +489,18 @@ class TsFileSeriesReader:
                 continue
 
             if include_timestamps:
-                timestamp_parts.append(arrow_table.column("time").to_numpy())
+                # Arrow may expose a zero-copy view here. Materialize an owning
+                # numpy array so downstream DataLoader workers always see normal,
+                # writable storage.
+                raw_timestamps = arrow_table.column("time").to_numpy()
+                timestamp_parts.append(np.array(raw_timestamps, dtype=np.int64, copy=True))
 
             for field_column in field_columns:
                 raw_values = arrow_table.column(field_column).to_numpy()
                 try:
-                    field_parts[field_column].append(np.asarray(raw_values, dtype=np.float64))
+                    # Avoid leaking Arrow-backed views to callers. Some worker
+                    # pipelines expect standard resizable/writable numpy storage.
+                    field_parts[field_column].append(np.array(raw_values, dtype=np.float64, copy=True))
                 except (TypeError, ValueError) as e:
                     target = table_name or "<unknown>"
                     raise TypeError(
