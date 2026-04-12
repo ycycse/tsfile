@@ -383,16 +383,40 @@ class TsFileSeriesReader:
         tag_values = dict(zip(table_entry.tag_columns, device_entry.tag_values))
         tag_filter = _build_exact_tag_filter(tag_values) if tag_values else None
         value_parts = []
-        with self._reader.query_table_by_row(
-            table_entry.table_name,
-            [field_name],
-            offset=offset,
-            limit=limit,
-            tag_filter=tag_filter,
-            batch_size=min(limit, _ROW_BATCH_SIZE),
-        ) as result_set:
-            _, field_parts = self._collect_arrow_numeric_batches(result_set, [field_name], include_timestamps=False)
-            value_parts = field_parts[field_name]
+        remaining = limit
+        next_offset = offset
+
+        # Keep values-only row reads behaviorally aligned with read_series_by_row:
+        # some native row-query paths may stop at an internal block boundary
+        # before the logical offset/limit window is fully consumed.
+        while remaining > 0:
+            with self._reader.query_table_by_row(
+                table_entry.table_name,
+                [field_name],
+                offset=next_offset,
+                limit=remaining,
+                tag_filter=tag_filter,
+                batch_size=min(remaining, _ROW_BATCH_SIZE),
+            ) as result_set:
+                _, field_parts = self._collect_arrow_numeric_batches(
+                    result_set,
+                    [field_name],
+                    include_timestamps=False,
+                    table_name=table_entry.table_name,
+                )
+                batch_parts = field_parts[field_name]
+
+            if not batch_parts:
+                break
+
+            batch_values = batch_parts[0] if len(batch_parts) == 1 else np.concatenate(batch_parts)
+            if len(batch_values) == 0:
+                break
+
+            value_parts.append(batch_values)
+            read_count = len(batch_values)
+            next_offset += read_count
+            remaining -= read_count
 
         if not value_parts:
             return np.array([], dtype=np.float64)
