@@ -722,10 +722,25 @@ def test_reader_catalog_shares_device_metadata_and_resolves_paths(tmp_path):
 
 
 def test_reader_read_series_by_row_retries_across_native_row_query_boundaries():
+    class _FakeColumn:
+        def __init__(self, values):
+            self._values = np.asarray(values)
+
+        def to_numpy(self):
+            return self._values
+
+    class _FakeArrowTable:
+        def __init__(self, columns):
+            self._columns = {name: _FakeColumn(values) for name, values in columns.items()}
+            self.num_rows = len(next(iter(columns.values()))) if columns else 0
+
+        def column(self, name):
+            return self._columns[name]
+
     class _FakeResultSet:
-        def __init__(self, rows):
-            self._rows = rows
-            self._index = -1
+        def __init__(self, batches):
+            self._batches = list(batches)
+            self._index = 0
 
         def __enter__(self):
             return self
@@ -733,12 +748,12 @@ def test_reader_read_series_by_row_retries_across_native_row_query_boundaries():
         def __exit__(self, exc_type, exc_val, exc_tb):
             return False
 
-        def next(self):
+        def read_arrow_batch(self):
+            if self._index >= len(self._batches):
+                return None
+            batch = self._batches[self._index]
             self._index += 1
-            return self._index < len(self._rows)
-
-        def get_value_by_name(self, name):
-            return self._rows[self._index][name]
+            return batch
 
     class _FakeNativeReader:
         def __init__(self, timestamps, values, boundary):
@@ -746,10 +761,11 @@ def test_reader_read_series_by_row_retries_across_native_row_query_boundaries():
             self._values = values
             self._boundary = boundary
 
-        def query_table_by_row(self, table_name, column_names, offset=0, limit=-1, tag_filter=None):
+        def query_table_by_row(self, table_name, column_names, offset=0, limit=-1, tag_filter=None, batch_size=0):
             assert table_name == "pvf"
             assert column_names == ["totalcloudcover"]
             assert tag_filter is None
+            assert batch_size == limit
             if limit < 0:
                 stop = len(self._timestamps)
             else:
@@ -759,11 +775,16 @@ def test_reader_read_series_by_row_retries_across_native_row_query_boundaries():
             # next internal boundary, so callers must re-issue from the
             # advanced offset to complete a large logical window.
             chunk_stop = min(stop, ((offset // self._boundary) + 1) * self._boundary)
-            rows = [
-                {"time": int(self._timestamps[idx]), "totalcloudcover": float(self._values[idx])}
-                for idx in range(offset, chunk_stop)
-            ]
-            return _FakeResultSet(rows)
+            return _FakeResultSet(
+                [
+                    _FakeArrowTable(
+                        {
+                            "time": self._timestamps[offset:chunk_stop],
+                            "totalcloudcover": self._values[offset:chunk_stop],
+                        }
+                    )
+                ]
+            )
 
     reader = object.__new__(TsFileSeriesReader)
     reader._reader = _FakeNativeReader(np.arange(30, dtype=np.int64), np.arange(30, dtype=np.float64), boundary=10)
@@ -774,6 +795,70 @@ def test_reader_read_series_by_row_retries_across_native_row_query_boundaries():
     ts_arr, values = reader.read_series_by_row(device_id, 0, 5, 12)
     np.testing.assert_array_equal(ts_arr, np.arange(5, 17, dtype=np.int64))
     np.testing.assert_array_equal(values, np.arange(5, 17, dtype=np.float64))
+
+
+def test_reader_read_series_values_by_row_uses_batch_arrow_query():
+    class _FakeColumn:
+        def __init__(self, values):
+            self._values = np.asarray(values)
+
+        def to_numpy(self):
+            return self._values
+
+    class _FakeArrowTable:
+        def __init__(self, columns):
+            self._columns = {name: _FakeColumn(values) for name, values in columns.items()}
+            self.num_rows = len(next(iter(columns.values()))) if columns else 0
+
+        def column(self, name):
+            return self._columns[name]
+
+    class _FakeResultSet:
+        def __init__(self, batches):
+            self._batches = list(batches)
+            self._index = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return False
+
+        def read_arrow_batch(self):
+            if self._index >= len(self._batches):
+                return None
+            batch = self._batches[self._index]
+            self._index += 1
+            return batch
+
+    class _FakeNativeReader:
+        def query_table_by_row(self, table_name, column_names, offset=0, limit=-1, tag_filter=None, batch_size=0):
+            assert table_name == "weather"
+            assert column_names == ["temperature"]
+            assert offset == 2
+            assert limit == 4
+            assert repr(tag_filter) == "(TagFilter(city == 'beijing') AND TagFilter(device == 'device_a'))"
+            assert batch_size == 4
+            return _FakeResultSet(
+                [
+                    _FakeArrowTable({"temperature": [22.0, 23.0]}),
+                    _FakeArrowTable({"temperature": [24.0, 25.0]}),
+                ]
+            )
+
+    reader = object.__new__(TsFileSeriesReader)
+    reader._reader = _FakeNativeReader()
+    reader._catalog = MetadataCatalog()
+    table_id = reader._catalog.add_table(
+        "weather",
+        ("city", "device"),
+        (TSDataType.STRING, TSDataType.STRING),
+        ("temperature",),
+    )
+    device_id = reader._catalog.add_device(table_id, ("beijing", "device_a"), 0, 9)
+
+    values = reader.read_series_values_by_row(device_id, 0, 2, 4)
+    np.testing.assert_array_equal(values, np.array([22.0, 23.0, 24.0, 25.0], dtype=np.float64))
 
 
 def test_reader_batch_reads_push_down_exact_tag_filter():
